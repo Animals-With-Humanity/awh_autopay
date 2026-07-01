@@ -22,13 +22,13 @@ const crypto = require("crypto");
 const Razorpay = require("razorpay");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
-const serviceAccount = require("./serviceAccountKey.json");
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 
 /* ── Validate critical env vars on startup ─────────────────────────── */
 const REQUIRED_ENV = [
-  // "RAZORPAY_KEY_ID",
-  // "RAZORPAY_KEY_SECRET",
-  // "RAZORPAY_WEBHOOK_SECRET",
+  "RAZORPAY_KEY_ID",
+  "RAZORPAY_KEY_SECRET",
+  "RAZORPAY_WEBHOOK_SECRET",
 ];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length) {
