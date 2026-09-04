@@ -2,7 +2,6 @@
  * seed-plans.js
  * Run once to pre-create the four monthly plans in Razorpay
  * and print the plan IDs for your .env file.
- *
  * Usage: node seed-plans.js
  
  
