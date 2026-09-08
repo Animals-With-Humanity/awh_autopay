@@ -14,6 +14,7 @@
  *   fundraisers/{id}             — campaign goal + raised totals
  *   fundraiser_donors/{id}       — donor name/email/contact stored before payment
  *   donations/{order_id}         — one-time Razorpay order for a campaign
+ *   general_donations/{order_id} — one-time Razorpay order, no campaign attached
  *   custom_plans/{amountPaise}   — reused Razorpay plan id per custom monthly amount
  */
 
@@ -836,6 +837,291 @@ app.post("/verify-donation", async (req, res) => {
   }
 });
 
+/* ══════════════════════════════════════════════════════════════════════
+   GENERAL ONE-TIME DONATION (Razorpay: UPI / cards / netbanking / wallets)
+
+   Kept completely separate from the fundraiser flow above: no campaign,
+   no goal tracker, its own `general_donations` collection. Nothing in the
+   subscription or fundraiser paths changes.
+
+   DUPLICATE PROTECTION (three independent layers):
+     1. Deterministic document IDs — general_donations/{orderId} and
+        payments/{paymentId}. A replayed write overwrites the same doc
+        instead of creating a second one.
+     2. A single Firestore transaction keyed on payments/{paymentId}.
+        Checkout verify, payment.captured and order.paid all race for the
+        same key; the first one wins and the rest become no-ops. This is
+        what stops "multiple success responses" from double-counting.
+     3. Webhook-level event dedupe on webhook_events/{eventId} (below).
+══════════════════════════════════════════════════════════════════════ */
+
+const GENERAL_DONATION = {
+  minPaise: 100,        // ₹1 — Razorpay's technical floor, no extra lower limit
+  suggestedAmountsInr: [500, 1000, 2500, 5000],
+};
+
+/* GET /donation-config ────────────────────────────────────────────── */
+app.get("/donation-config", (_req, res) => {
+  res.json({
+    success: true,
+    min_inr: GENERAL_DONATION.minPaise / 100,
+    suggested_amounts: GENERAL_DONATION.suggestedAmountsInr,
+  });
+});
+
+/**
+ * Records a captured one-time donation exactly once.
+ * payments/{paymentId} is the idempotency key, so checkout verify and the
+ * payment.captured / order.paid webhooks cannot each write their own entry.
+ */
+async function recordGeneralDonationCapture({ paymentId, orderId, amountPaise, method, source }) {
+  const paymentRef = db.collection("payments").doc(paymentId);
+  const donationRef = db.collection("general_donations").doc(orderId);
+
+  return db.runTransaction(async (tx) => {
+    const paymentSnap = await tx.get(paymentRef);
+    if (paymentSnap.exists) {
+      // Another caller (webhook or verify) already booked this payment
+      return { alreadyRecorded: true };
+    }
+
+    const donationSnap = await tx.get(donationRef);
+    if (!donationSnap.exists) {
+      return { notAGeneralDonation: true };
+    }
+
+    const donation = donationSnap.data();
+    // Trust the amount stored at order time; fall back to the webhook amount
+    const capturedPaise = Number(donation.amountPaise || amountPaise || 0);
+
+    tx.set(paymentRef, {
+      paymentId,
+      orderId,
+      donationType: "general",
+      amount: capturedPaise,
+      currency: "INR",
+      source,
+      verifiedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Defensive: payment doc missing but donation already captured (e.g. a
+    // manual cleanup). Book the payment key, never re-run the side effects.
+    if (donation.status === "captured") {
+      return { alreadyRecorded: true };
+    }
+
+    tx.update(donationRef, {
+      status: "captured",
+      paymentId,
+      method: method || donation.method || "",
+      capturedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return { alreadyRecorded: false };
+  });
+}
+
+/**
+ * If the order was created at Razorpay but the Firestore write did not land,
+ * rebuild the donation doc from the payment notes so the webhook can still
+ * record the money. Returns false for payments that are not general donations.
+ */
+async function seedGeneralDonationFromPaymentNotes(orderId, paymentEntity) {
+  const donationRef = db.collection("general_donations").doc(orderId);
+  const snap = await donationRef.get();
+  if (snap.exists) return true;
+
+  const notes = paymentEntity?.notes || {};
+  if (notes.donation_type !== "general") return false;
+
+  try {
+    await donationRef.create({
+      orderId,
+      amountPaise: Number(paymentEntity?.amount || 0),
+      name: notes.donor_name || "",
+      email: notes.donor_email || "",
+      contact: notes.donor_contact || "",
+      status: "created",
+      source: "webhook_seeded",
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  } catch (_err) {
+    // A concurrent webhook delivery already seeded it — safe to continue
+  }
+  return true;
+}
+
+async function captureGeneralDonationFromWebhook(paymentEntity, source) {
+  const orderId = paymentEntity?.order_id;
+  const paymentId = paymentEntity?.id;
+  if (!orderId || !paymentId) return { skipped: true };
+
+  const seeded = await seedGeneralDonationFromPaymentNotes(orderId, paymentEntity);
+  if (!seeded) return { notAGeneralDonation: true };
+
+  return recordGeneralDonationCapture({
+    paymentId,
+    orderId,
+    amountPaise: paymentEntity?.amount,
+    method: paymentEntity?.method,
+    source,
+  });
+}
+
+async function markGeneralDonationFailed(orderId, paymentEntity) {
+  const ref = db.collection("general_donations").doc(orderId);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+  // Webhooks can arrive out of order — never downgrade a captured donation
+  if (snap.data().status === "captured") return;
+
+  await ref.update({
+    status: "failed",
+    failureReason: paymentEntity?.error_description || "Payment failed",
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+}
+
+/* POST /donate ────────────────────────────────────────────────────── */
+/**
+ * Creates a Razorpay order for a general one-time donation and stores the
+ * donor details under general_donations/{orderId} before checkout opens.
+ * No payment method is restricted, so Razorpay offers UPI, cards,
+ * net banking and wallets.
+ */
+app.post("/donate", async (req, res) => {
+  try {
+    const { name, email, contact, amountInr } = req.body;
+
+    if (!name || !email || !contact || amountInr === undefined || amountInr === null) {
+      return res.status(400).json({ success: false, error: "Missing required fields: name, email, contact, amountInr" });
+    }
+    if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 100) {
+      return res.status(400).json({ success: false, error: "Invalid name" });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, error: "Invalid email address" });
+    }
+    const normalizedContact = String(contact).replace(/\D/g, "");
+    if (!/^[6-9]\d{9}$/.test(normalizedContact)) {
+      return res.status(400).json({ success: false, error: "Invalid contact number (must be 10-digit Indian mobile)" });
+    }
+
+    const amountRupees = Number(amountInr);
+    if (!Number.isFinite(amountRupees) || !Number.isInteger(amountRupees)) {
+      return res.status(400).json({ success: false, error: "Amount must be a whole number in rupees" });
+    }
+    const amountPaise = amountRupees * 100;
+    if (amountPaise < GENERAL_DONATION.minPaise) {
+      return res.status(400).json({
+        success: false,
+        error: `Minimum donation is ₹${(GENERAL_DONATION.minPaise / 100).toLocaleString("en-IN")}`,
+      });
+    }
+
+    const receipt = `awh_${Date.now()}`.slice(0, 40);
+    const order = await razorpay.orders.create({
+      amount: amountPaise,
+      currency: "INR",
+      receipt,
+      notes: {
+        donation_type: "general",
+        donor_name: name.trim(),
+        donor_email: email.toLowerCase().trim(),
+        donor_contact: normalizedContact,
+        org: "Animals With Humanity",
+      },
+    });
+
+    // Doc ID is the Razorpay order ID — a retry can never create a second doc
+    await db.collection("general_donations").doc(order.id).set({
+      orderId: order.id,
+      amountPaise,
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      contact: normalizedContact,
+      status: "created",
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    log("info", "General donation intent stored", { orderId: order.id });
+
+    res.json({
+      success: true,
+      order_id: order.id,
+      amount_paise: amountPaise,
+      amount_inr: amountRupees,
+      razorpay_key: process.env.RAZORPAY_KEY_ID,
+      prefill: {
+        name: name.trim(),
+        email: email.toLowerCase().trim(),
+        contact: normalizedContact,
+      },
+    });
+  } catch (err) {
+    log("error", "create-general-donation error", { message: err.message });
+    res.status(500).json({ success: false, error: "Failed to start donation. Please try again." });
+  }
+});
+
+/* POST /verify-general-donation ───────────────────────────────────── */
+/**
+ * Called by the frontend right after Razorpay checkout succeeds.
+ * The webhook is the authoritative backup; both funnel through the same
+ * payments/{paymentId} transaction, so whichever lands second is a no-op.
+ */
+app.post("/verify-general-donation", async (req, res) => {
+  try {
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body;
+
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, error: "Missing payment verification fields" });
+    }
+
+    const generatedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    const sigBuffer = Buffer.from(generatedSignature, "hex");
+    const receivedBuffer = Buffer.from(razorpay_signature || "", "hex");
+    const sigValid =
+      sigBuffer.length === receivedBuffer.length &&
+      crypto.timingSafeEqual(sigBuffer, receivedBuffer);
+
+    if (!sigValid) {
+      log("error", "General donation signature mismatch", { paymentId: razorpay_payment_id });
+      return res.status(400).json({ success: false, error: "Payment verification failed" });
+    }
+
+    const donationSnap = await db.collection("general_donations").doc(razorpay_order_id).get();
+    if (!donationSnap.exists) {
+      return res.status(404).json({ success: false, error: "Donation order not found" });
+    }
+
+    const result = await recordGeneralDonationCapture({
+      paymentId: razorpay_payment_id,
+      orderId: razorpay_order_id,
+      amountPaise: donationSnap.data().amountPaise,
+      source: "checkout_verify",
+    });
+
+    log("info", "General donation verified", {
+      paymentId: razorpay_payment_id,
+      orderId: razorpay_order_id,
+      reused: !!result.alreadyRecorded,
+    });
+
+    res.json({ success: true, message: result.alreadyRecorded ? "Payment already verified" : "Payment verified" });
+  } catch (err) {
+    log("error", "verify-general-donation error", { message: err.message });
+    res.status(500).json({ success: false, error: "Verification failed" });
+  }
+});
+
 /* POST /webhook ───────────────────────────────────────────────────── */
 /**
  * Razorpay sends webhooks for all subscription lifecycle events.
@@ -878,20 +1164,25 @@ app.post("/webhook", async (req, res) => {
     /* ── Idempotency: use Razorpay's event ID ─────────────────────── */
     const eventId = payload.id || `${event}_${Date.now()}`;
     const eventRef = db.collection("webhook_events").doc(eventId);
-    const eventSnap = await eventRef.get();
 
-    if (eventSnap.exists) {
+    // create() fails atomically when the doc already exists. The previous
+    // get()-then-set() left a window where two concurrent deliveries of the
+    // same event (Razorpay retries while the first is still processing) both
+    // passed the check and processed the payload twice.
+    try {
+      await eventRef.create({
+        eventId,
+        event,
+        receivedAt: FieldValue.serverTimestamp(),
+        processed: false,
+      });
+    } catch (createErr) {
+      const alreadyExists =
+        createErr?.code === 6 || /ALREADY_EXISTS/i.test(createErr?.message || "");
+      if (!alreadyExists) throw createErr;
       log("info", "Duplicate webhook event ignored", { eventId, event });
       return res.json({ received: true }); // Always 200 to Razorpay
     }
-
-    // Record event first (before processing) to prevent race conditions
-    await eventRef.set({
-      eventId,
-      event,
-      receivedAt: FieldValue.serverTimestamp(),
-      processed: false,
-    });
 
     /* ── Process event ────────────────────────────────────────────── */
     await processWebhookEvent(event, data, eventRef);
@@ -1058,12 +1349,26 @@ async function processWebhookEvent(event, data, eventRef) {
         const capturePaymentId = capturePayment?.id || paymentId;
         if (!capturePaymentId || !orderId) break;
 
-        const result = await captureFundraiserFromWebhook(
-          capturePayment || { id: capturePaymentId, order_id: orderId, amount: orderEntity?.amount_paid, notes: orderEntity?.notes },
-          event === "order.paid" ? "webhook_order_paid" : "webhook_captured"
-        );
+        const captureEntity =
+          capturePayment || { id: capturePaymentId, order_id: orderId, amount: orderEntity?.amount_paid, notes: orderEntity?.notes };
+        const captureSource = event === "order.paid" ? "webhook_order_paid" : "webhook_captured";
+
+        const result = await captureFundraiserFromWebhook(captureEntity, captureSource);
         if (result.notADonation || result.skipped) {
-          log("info", `${event} ignored (not a fundraiser order)`, { paymentId: capturePaymentId, orderId });
+          // Not a campaign donation — try the one-time donation ledger before
+          // giving up. Shares the same payments/{paymentId} idempotency key, so
+          // order.paid and payment.captured for one payment book it only once.
+          const generalResult = await captureGeneralDonationFromWebhook(captureEntity, captureSource);
+          if (generalResult.notAGeneralDonation || generalResult.skipped) {
+            log("info", `${event} ignored (not a tracked donation order)`, { paymentId: capturePaymentId, orderId });
+          } else {
+            log("info", "General donation captured", {
+              paymentId: capturePaymentId,
+              orderId,
+              event,
+              reused: !!generalResult.alreadyRecorded,
+            });
+          }
         } else {
           log("info", "Fundraiser payment captured", {
             paymentId: capturePaymentId,
@@ -1080,7 +1385,11 @@ async function processWebhookEvent(event, data, eventRef) {
         if (!orderId) break;
         const donationRef = db.collection("donations").doc(orderId);
         const donationSnap = await donationRef.get();
-        if (!donationSnap.exists) break;
+        if (!donationSnap.exists) {
+          // Not a campaign order — it may be a general one-time donation
+          await markGeneralDonationFailed(orderId, paymentEntity);
+          break;
+        }
         if (donationSnap.data().status === "captured") break;
         await donationRef.update({
           status: "failed",
