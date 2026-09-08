@@ -4,7 +4,6 @@
  * and print the plan IDs for your .env file.
  * Usage: node seed-plans.js
  
- 
  */
 
 require("dotenv").config();
