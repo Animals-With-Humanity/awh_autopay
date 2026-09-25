@@ -84,7 +84,7 @@ app.use(express.json());
 const PREDEFINED_PLANS = [
   {
     key: "ally",
-    label: "Ally",
+    label: "Virtual Feeder",
     amount: 109900,   // ₹1099 
     description: "Help feed a rescued animal every month",
     perks: ["Feed 1 rescued dog/month", "Monthly impact email", "Digital gratitude card"],
@@ -100,21 +100,21 @@ const PREDEFINED_PLANS = [
   },
   {
     key: "supporter",
-    label: "Supporter",
+    label: "Virtual Guardian",
     amount: 509900,   // ₹5099
-    description: "Fund emergency medical care for injured animals",
+    description: "Sponsor a sterilisation + vaccination of a animal every month",
     perks: ["Emergency care", "Rescue update stories", "Name in monthly credits"],
     emoji: "🚑",
     popular: true,
   },
-  {
-    key: "guardian",
-    label: "Guardian",
-    amount: 1099900,  // ₹10999
-    description: "Sponsor a sterilisation + vaccination drive",
-    perks: ["Sponsor 1 sterilisation/month", "Featured on AWH social", "Guardian certificate"],
-    emoji: "🛡️",
-  },
+  // {
+  //   key: "guardian",
+  //   label: "Guardian",
+  //   amount: 1099900,  // ₹10999
+  //   description: "Sponsor a sterilisation + vaccination drive",
+  //   perks: ["Sponsor 1 sterilisation/month", "Featured on AWH social", "Guardian certificate"],
+  //   emoji: "🛡️",
+  // },
 
 ];
 
