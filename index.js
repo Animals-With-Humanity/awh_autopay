@@ -87,15 +87,15 @@ const PREDEFINED_PLANS = [
     label: "Virtual Feeder",
     amount: 109900,   // ₹1099 
     description: "Help feed a rescued animal every month",
-    perks: ["Feed 1 rescued dog/month", "Monthly impact email", "Digital gratitude card"],
+    perks: ["Feed 1 rescued animal/month", "Monthly impact email", "Digital gratitude card"],
     emoji: "🐾",
   },
   {
     key: "virtualAdoptor",
     label: "Virtual Adoptor",
     amount: 209900,   // ₹2099 
-    description: "Virtual Adopt a rescued animal every month",
-    perks: ["Virtual Adopt a rescued animal/month", "Monthly impact email", "Digital gratitude card", "Virtual Adoptor certificate"],
+    description: "Virtually Adopt a rescued animal every month",
+    perks: ["Virtually Adopt a rescued animal/month", "Monthly impact email", "Digital gratitude card", "Virtual Adoptor certificate"],
     emoji: "🐱",
   },
   {
